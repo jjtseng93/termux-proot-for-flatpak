@@ -43,10 +43,11 @@ unset LD_PRELOAD
 
 echo ''
 echo '===='
-echo Rootfs from $flag_rootfs proot-distro
+echo Rootfs:"$1" from $flag_rootfs proot-distro
 echo '===='
 
 exec "$proot_bin" -S "$rootfs" \
+  -l \
   -b "$sd"/fakeid.txt:/proc/sys/kernel/overflowuid \
   -b "$sd"/fakeid.txt:/proc/sys/kernel/overflowgid \
   -b "$PREFIX"/tmp:/tmp \
