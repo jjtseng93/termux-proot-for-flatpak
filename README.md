@@ -9,8 +9,8 @@ which is a copy of [the PRoot project](https://github.com/proot-me/PRoot/) with 
 ## Purpose
 - To run flatpaks in Android Termux proot
 ## Usage
-- proot-distro install <distro>
-- pd login <distro>
+- proot-distro install <distro_name>
+- pd login <distro_name>
 - install flatpak & add flathub
 
 ```shell
@@ -25,10 +25,10 @@ https://dl.flathub.org/repo/flathub.flatpakrepo
 - export LIBGL_ALWAYS_SOFTWARE=1
 - export DISPLAY=:0
 - xfwm4 &
-- ./enter_rootfs.sh <distro>
+- ./enter_rootfs.sh <distro_name>
   * it compiles a newer version proot
 - su <user_name>
-- cd /path/to/flatpak_helpers
+- cd /path/to/flatpak_helper
 - export DISPLAY=:0 
 - (or your termux-x11 startup number)
 - sh run.sh <your_package>
