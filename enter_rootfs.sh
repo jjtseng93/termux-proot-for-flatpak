@@ -12,10 +12,10 @@ old_pddir=$PREFIX/var/lib/proot-distro/installed-rootfs/$1
 new_pddir=$PREFIX/var/lib/proot-distro/containers/$1/rootfs
 
 if [ -d "$new_pddir" ] ; then
-  echo Rootfs from new proot-distro
+  flag_rootfs=new
   rootfs=$new_pddir
 elif [ -d "$old_pddir" ] ; then
-  echo Rootfs from old proot-distro
+  flag_rootfs=old
   rootfs=$old_pddir
 else
   echo Rootfs not found: $1
@@ -41,6 +41,10 @@ fi
 
 unset LD_PRELOAD
 
+echo ''
+echo '===='
+echo Rootfs from $flag_rootfs proot-distro
+echo '===='
 
 exec "$proot_bin" -S "$rootfs" \
   -b "$sd"/fakeid.txt:/proc/sys/kernel/overflowuid \
