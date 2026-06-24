@@ -144,6 +144,21 @@ static int handle_option_q(Tracee *tracee, const Cli *cli UNUSED, const char *va
 	return 0;
 }
 
+static bool has_pending_binding(const Tracee *tracee, const char *guest_path)
+{
+	Binding *binding;
+
+	if (tracee->fs == NULL || tracee->fs->bindings.pending == NULL)
+		return false;
+
+	CIRCLEQ_FOREACH(binding, tracee->fs->bindings.pending, link.pending) {
+		if (strcmp(binding->guest.path, guest_path) == 0)
+			return true;
+	}
+
+	return false;
+}
+
 static int handle_option_w(Tracee *tracee, const Cli *cli UNUSED, const char *value)
 {
 	tracee->fs->cwd = talloc_strdup(tracee->fs, value);
@@ -392,6 +407,14 @@ static int pre_initialize_bindings(Tracee *tracee, const Cli *cli,
 			return -1;
 	}
 
+	/* Android hosts often expose /dev/full inconsistently.  Back the
+	 * guest-facing node with /dev/zero and emulate the ENOSPC write
+	 * behavior in syscall/exit.c.  Keep any explicit user binding
+	 * for /dev/full intact. 
+	*/
+	if (!has_pending_binding(tracee, "/dev/full"))
+		new_binding(tracee, "/dev/zero", "/dev/full", false);
+    
 	return cursor;
 }
 

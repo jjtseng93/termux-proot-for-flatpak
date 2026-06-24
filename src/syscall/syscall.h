@@ -36,8 +36,8 @@ extern void translate_syscall(Tracee *tracee);
 extern int  translate_syscall_enter(Tracee *tracee);
 extern void translate_syscall_exit(Tracee *tracee);
 
-extern void apply_emulated_mount(Tracee *tracee);
-extern void apply_emulated_pivot_root(Tracee *tracee);
-extern void apply_emulated_umount(Tracee *tracee);
+extern int apply_emulated_mount(Tracee *tracee);
+extern int apply_emulated_pivot_root(Tracee *tracee);
+extern int apply_emulated_umount(Tracee *tracee);
 
 #endif /* SYSCALL_H */

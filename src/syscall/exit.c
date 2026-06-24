@@ -48,6 +48,25 @@
 #include "extension/extension.h"
 #include "arch.h"
 
+static int is_dev_full_fd(Tracee *tracee, int fd)
+{
+	char path[PATH_MAX];
+	int status;
+
+	if (fd < 0)
+		return 0;
+
+	status = readlink_proc_pid_fd(tracee->pid, fd, path);
+	if (status < 0)
+		return 0;
+
+	status = detranslate_path(tracee, path, NULL);
+	if (status < 0)
+		return 0;
+
+	return strcmp(path, "/dev/full") == 0;
+}
+
 /**
  * Translate the output arguments of the current @tracee's syscall in
  * the @tracee->pid process area. This function sets the result of
@@ -556,6 +575,19 @@ void translate_syscall_exit(Tracee *tracee)
 		tracee->restart_how = PTRACE_SYSCALL;
 		goto end;
 	}
+
+	case PR_write:
+	case PR_writev:
+	case PR_pwrite64:
+	case PR_pwritev:
+	case PR_pwritev2:
+		if ((ssize_t) syscall_result <= 0)
+			goto end;
+		if (is_dev_full_fd(tracee, (int) peek_reg(tracee, ORIGINAL, SYSARG_1))) {
+			status = -ENOSPC;
+			break;
+		}
+		goto end;
 
 	case PR_prctl: {
 #ifndef PR_GET_AUXV

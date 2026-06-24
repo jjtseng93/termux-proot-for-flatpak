@@ -208,19 +208,16 @@ static int handle_seccomp_event_common(Tracee *tracee)
 	 * they succeeded and apply the mount/pivot_root binding
 	 * emulation so sandbox helpers like bubblewrap can proceed.  */
 	case PR_mount:
-		apply_emulated_mount(tracee);
-		set_result_after_seccomp(tracee, 0);
+		set_result_after_seccomp(tracee, apply_emulated_mount(tracee));
 		break;
 
 	case PR_pivot_root:
-		apply_emulated_pivot_root(tracee);
-		set_result_after_seccomp(tracee, 0);
+		set_result_after_seccomp(tracee, apply_emulated_pivot_root(tracee));
 		break;
 
 	case PR_umount:
 	case PR_umount2:
-		apply_emulated_umount(tracee);
-		set_result_after_seccomp(tracee, 0);
+		set_result_after_seccomp(tracee, apply_emulated_umount(tracee));
 		break;
 
 	case PR_unshare:

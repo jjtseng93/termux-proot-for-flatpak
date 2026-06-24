@@ -45,6 +45,7 @@
 #include <netpacket/packet.h> /* struct sockaddr_ll (AF_PACKET) */
 #include <sys/ioctl.h>   /* ioctl(2): SIOCGIFMTU / SIOCGIFHWADDR */
 #include <sys/time.h>    /* struct timeval, for SO_RCVTIMEO */
+#include <sys/stat.h>   /* stat(2), S_ISDIR */
 
 /* ABI-stable rtnetlink constants we synthesise for the loopback reply.
  * Defined locally so we needn't pull in <linux/if.h> / <linux/if_arp.h>,
@@ -90,6 +91,12 @@
 #define CLONE_NS_MASK (CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | \
 		       CLONE_NEWUSER | CLONE_NEWPID | CLONE_NEWNET | \
 		       CLONE_NEWCGROUP | CLONE_NEWTIME)
+
+/* pivot_root(".", ".") leaves the old root reachable through open
+ * directory descriptors but not through a normal pathname.  PRoot's
+ * fd handling is path-based, so keep a private alias until the caller
+ * fchdir()s to that descriptor and detaches it with umount2(). */
+#define DETACHED_OLD_ROOT "/.proot-pivot-oldroot"
 
 /**
  * Translate @path and put the result in the @tracee's memory address
@@ -163,23 +170,26 @@ static int guest_canonicalize(Tracee *tracee, const char *user_path,
  * PRoot binding from a host directory to the canonicalized target.
  * Bind mounts use the translated source; "proc"/"sysfs" use the
  * matching host file-system; "tmpfs"/"devpts"/"devtmpfs" get a fresh
- * empty directory.  Any other case is silently ignored: the caller
- * will still see the syscall succeed (we always void it).
+ * empty directory.  Any other case is silently ignored.  Failures
+ * while translating or installing a supported mount are returned to
+ * the tracee instead of reporting a mount that does not exist.
  */
-static void emulate_mount(Tracee *tracee, const char *src_user,
-			  const char *target_user, const char *fstype,
-			  unsigned long flags)
+static int emulate_mount(Tracee *tracee, const char *src_user,
+			 const char *target_user, const char *fstype,
+			 unsigned long flags)
 {
 	char host_path[PATH_MAX];
 	char guest_path[PATH_MAX];
 	const char *tmpdir;
+	int status;
 
 	if ((flags & MS_REMOUNT) != 0)
-		return;
+		return 0;
 
 	if ((flags & MS_BIND) != 0) {
-		if (translate_path(tracee, host_path, AT_FDCWD, src_user, true) < 0)
-			return;
+		status = translate_path(tracee, host_path, AT_FDCWD, src_user, true);
+		if (status < 0)
+			return status;
 	}
 	else if (strcmp(fstype, "proc") == 0)
 		strcpy(host_path, "/proc");
@@ -192,19 +202,23 @@ static void emulate_mount(Tracee *tracee, const char *src_user,
 	else if (strcmp(fstype, "tmpfs") == 0) {
 		tmpdir = create_temp_directory(tracee->fs, "proot-tmpfs-");
 		if (tmpdir == NULL)
-			return;
+			return -ENOMEM;
 		strncpy(host_path, tmpdir, PATH_MAX - 1);
 		host_path[PATH_MAX - 1] = '\0';
 	}
 	else
-		return;
+		return 0;
 
 	chop_finality(host_path);
 
-	if (guest_canonicalize(tracee, target_user, guest_path) < 0)
-		return;
+	status = guest_canonicalize(tracee, target_user, guest_path);
+	if (status < 0)
+		return status;
 
-	(void) insort_binding3(tracee, tracee->fs, host_path, guest_path);
+	if (insort_binding3(tracee, tracee->fs, host_path, guest_path) == NULL)
+		return -ENOMEM;
+
+	return 0;
 }
 
 /**
@@ -212,10 +226,11 @@ static void emulate_mount(Tracee *tracee, const char *src_user,
  * tracee's root binding to point at @new_root_user (translated to
  * host) and re-exposing the previous root at @put_old_user, so that
  * sandbox helpers like bubblewrap can keep accessing the prior
- * file-system through the agreed "oldroot" path.
+ * file-system through the agreed "oldroot" path.  Return a negative
+ * errno if the root transition cannot be represented faithfully.
  */
-static void emulate_pivot_root(Tracee *tracee, const char *new_root_user,
-			       const char *put_old_user)
+static int emulate_pivot_root(Tracee *tracee, const char *new_root_user,
+			      const char *put_old_user)
 {
 	char new_root_host[PATH_MAX];
 	char new_root_guest[PATH_MAX];
@@ -227,29 +242,84 @@ static void emulate_pivot_root(Tracee *tracee, const char *new_root_user,
 	size_t put_old_len = 0;
 	char put_old_after[PATH_MAX];
 	bool have_put_old = false;
+	bool detached_old_root = false;
 	size_t count = 0;
 	size_t i;
 	Binding *iter;
+	Binding *new_root_binding;
+	bool have_direct_guest_path = false;
+	int status;
 
-	if (translate_path(tracee, new_root_host, AT_FDCWD, new_root_user, true) < 0)
-		return;
-	chop_finality(new_root_host);
+	/* bubblewrap uses either an absolute mountpoint or "." after
+	 * chdir(new_root).  Recognize those forms before filesystem
+	 * canonicalization: the mountpoint is represented by a PRoot
+	 * binding and its placeholder in the current root might already
+	 * have disappeared as part of the staged root setup. */
+	if (strcmp(new_root_user, ".") == 0 && tracee->fs->cwd != NULL) {
+		strncpy(new_root_guest, tracee->fs->cwd, PATH_MAX - 1);
+		new_root_guest[PATH_MAX - 1] = '\0';
+		have_direct_guest_path = true;
+	}
+	else if (new_root_user[0] == '/'
+		 && strstr(new_root_user, "/../") == NULL
+		 && strstr(new_root_user, "/./") == NULL
+		 && strcmp(new_root_user, "/..") != 0
+		 && strcmp(new_root_user, "/.") != 0) {
+		strncpy(new_root_guest, new_root_user, PATH_MAX - 1);
+		new_root_guest[PATH_MAX - 1] = '\0';
+		chop_finality(new_root_guest);
+		have_direct_guest_path = true;
+	}
 
-	if (guest_canonicalize(tracee, new_root_user, new_root_guest) < 0)
-		return;
+	new_root_binding = have_direct_guest_path
+		? get_binding(tracee, GUEST, new_root_guest)
+		: NULL;
+
+	if (new_root_binding == NULL
+	    || strcmp(new_root_binding->guest.path, new_root_guest) != 0) {
+		status = guest_canonicalize(tracee, new_root_user, new_root_guest);
+		if (status < 0)
+			return status;
+		new_root_binding = get_binding(tracee, GUEST, new_root_guest);
+	}
+
+	/* A pivot root is normally a mountpoint.  Prefer the exact binding
+	 * that represents that mountpoint instead of resolving through the
+	 * old root again.  This is important for bubblewrap's second pivot:
+	 * /newroot is an emulated bind mount whose backing directory is not
+	 * necessarily reachable by walking the old root without applying
+	 * the binding first. */
+	if (new_root_binding != NULL
+	    && strcmp(new_root_binding->guest.path, new_root_guest) == 0) {
+		strncpy(new_root_host, new_root_binding->host.path, PATH_MAX - 1);
+		new_root_host[PATH_MAX - 1] = '\0';
+	}
+	else {
+		status = translate_path(tracee, new_root_host, AT_FDCWD,
+					new_root_user, true);
+		if (status < 0)
+			return status;
+		chop_finality(new_root_host);
+	}
 
 	/* put_old is relative to new_root, so resolve it against
 	 * new_root_guest rather than the current cwd. */
-	if (put_old_user[0] == '/')
+	if (strcmp(put_old_user, new_root_user) == 0) {
+		strcpy(put_old_guest, new_root_guest);
+	}
+	else if (put_old_user[0] == '/')
 		strcpy(put_old_guest, "/");
 	else
 		strcpy(put_old_guest, new_root_guest);
-	if (canonicalize(tracee, put_old_user, true, put_old_guest, 0) < 0)
-		return;
+	if (strcmp(put_old_user, new_root_user) != 0) {
+		status = canonicalize(tracee, put_old_user, true, put_old_guest, 0);
+		if (status < 0)
+			return status;
+	}
 
 	root_binding = get_binding(tracee, GUEST, "/");
 	if (root_binding == NULL)
-		return;
+		return -ENOENT;
 	strncpy(old_root_host, root_binding->host.path, PATH_MAX - 1);
 	old_root_host[PATH_MAX - 1] = '\0';
 
@@ -258,11 +328,19 @@ static void emulate_pivot_root(Tracee *tracee, const char *new_root_user,
 	/* Work out where the previous root becomes reachable: put_old as a
 	 * path under the *new* root, e.g. "/oldroot".  The pivot_root(".",
 	 * ".") trick used to detach the old root leaves new_root == put_old,
-	 * in which case there is nowhere to expose it. */
-	if (   new_root_len > 0
-	    && strncmp(put_old_guest, new_root_guest, new_root_len) == 0
-	    && (   put_old_guest[new_root_len] == '/'
-		|| (new_root_len == 1 && new_root_guest[0] == '/'))) {
+	 * in which case Linux leaves it reachable only through already-open
+	 * file descriptors.  Give that detached root a private PRoot alias
+	 * so path-based fd translation can preserve the same behaviour. */
+	if (strcmp(put_old_guest, new_root_guest) == 0) {
+		strcpy(put_old_after, DETACHED_OLD_ROOT);
+		put_old_len = strlen(put_old_after);
+		have_put_old = true;
+		detached_old_root = true;
+	}
+	else if (   new_root_len > 0
+		&& strncmp(put_old_guest, new_root_guest, new_root_len) == 0
+		&& (   put_old_guest[new_root_len] == '/'
+		    || (new_root_len == 1 && new_root_guest[0] == '/'))) {
 		const char *after = put_old_guest + (new_root_len == 1 ? 0 : new_root_len);
 		if (after[0] == '/' && after[1] != '\0') {
 			strncpy(put_old_after, after, PATH_MAX - 1);
@@ -282,7 +360,7 @@ static void emulate_pivot_root(Tracee *tracee, const char *new_root_user,
 
 	snapshot = talloc_array(tracee->ctx, Binding *, count);
 	if (snapshot == NULL)
-		return;
+		return -ENOMEM;
 	i = 0;
 	for (iter = CIRCLEQ_FIRST(tracee->fs->bindings.guest);
 	     iter != (void *) tracee->fs->bindings.guest && i < count;
@@ -293,9 +371,16 @@ static void emulate_pivot_root(Tracee *tracee, const char *new_root_user,
 	 * put_old, so the tracee can still reach it (bubblewrap accesses
 	 * everything via "/oldroot" right after the pivot). */
 	remove_binding_from_all_lists(tracee, root_binding);
-	(void) insort_binding3(tracee, tracee->fs, new_root_host, "/");
-	if (have_put_old)
-		(void) insort_binding3(tracee, tracee->fs, old_root_host, put_old_after);
+	if (insort_binding3(tracee, tracee->fs, new_root_host, "/") == NULL) {
+		(void) insort_binding3(tracee, tracee->fs, old_root_host, "/");
+		talloc_free(snapshot);
+		return -ENOMEM;
+	}
+	if (have_put_old
+	    && insort_binding3(tracee, tracee->fs, old_root_host, put_old_after) == NULL) {
+		talloc_free(snapshot);
+		return -ENOMEM;
+	}
 
 	for (i = 0; i < count; i++) {
 		Binding *b = snapshot[i];
@@ -305,6 +390,15 @@ static void emulate_pivot_root(Tracee *tracee, const char *new_root_user,
 			continue;
 
 		blen = strlen(b->guest.path);
+
+		/* The mountpoint that became the new root is now represented
+		 * by the "/" binding installed above.  Keeping the old guest
+		 * name as well would leave two views of the same mount and can
+		 * shadow later mounts at that path. */
+		if (strcmp(b->guest.path, new_root_guest) == 0) {
+			remove_binding_from_all_lists(tracee, b);
+			continue;
+		}
 
 		/* Bindings that live under the new root move *with* the pivot:
 		 * "/newroot/usr" becomes "/usr".  Without this, the tracee's
@@ -328,7 +422,7 @@ static void emulate_pivot_root(Tracee *tracee, const char *new_root_user,
 		/* Everything else belonged to the previous root tree;
 		 * re-expose it under put_old (skipping what already sits
 		 * there) and keep the original in place. */
-		if (have_put_old) {
+		if (have_put_old && !detached_old_root) {
 			char aliased[PATH_MAX];
 
 			if (   strncmp(b->guest.path, put_old_after, put_old_len) == 0
@@ -346,7 +440,73 @@ static void emulate_pivot_root(Tracee *tracee, const char *new_root_user,
 		}
 	}
 
+	/* pivot_root preserves the process's cwd inode, but changes how it
+	 * is named from the new root.  Keep PRoot's virtual cwd in sync:
+	 * a cwd below new_root loses that prefix, while a cwd in the old
+	 * tree becomes reachable below put_old.  Bubblewrap relies on this
+	 * when it chdirs to /newroot and then pivots using ".". */
+	if (tracee->fs->cwd != NULL) {
+		char rebased_cwd[PATH_MAX];
+		char *new_cwd;
+		size_t cwd_len = strlen(tracee->fs->cwd);
+
+		if (strcmp(tracee->fs->cwd, new_root_guest) == 0) {
+			strcpy(rebased_cwd, "/");
+		}
+		else if (   cwd_len > new_root_len
+			&& strncmp(tracee->fs->cwd, new_root_guest, new_root_len) == 0
+			&& tracee->fs->cwd[new_root_len] == '/') {
+			strcpy(rebased_cwd, tracee->fs->cwd + new_root_len);
+		}
+		else if (have_put_old) {
+			if ((size_t) snprintf(rebased_cwd, sizeof(rebased_cwd), "%s%s",
+					      put_old_after, tracee->fs->cwd)
+			    >= sizeof(rebased_cwd)) {
+				talloc_free(snapshot);
+				return -ENAMETOOLONG;
+			}
+		}
+		else {
+			strncpy(rebased_cwd, tracee->fs->cwd, PATH_MAX - 1);
+			rebased_cwd[PATH_MAX - 1] = '\0';
+		}
+
+		new_cwd = talloc_strdup(tracee->fs, rebased_cwd);
+		if (new_cwd == NULL) {
+			talloc_free(snapshot);
+			return -ENOMEM;
+		}
+		talloc_free(tracee->fs->cwd);
+		tracee->fs->cwd = new_cwd;
+		talloc_set_name_const(tracee->fs->cwd, "$cwd");
+	}
+
+	/* If the old root contains a /.l2s directory (used by OSTree's
+	 * link-to-symlink fallback when hardlinks are unavailable), make it
+	 * accessible inside the new sandbox root via two bindings:
+	 *
+	 * 1. "/.l2s" -> l2s_host: for symlinks whose target is the guest
+	 *    absolute path "/.l2s/..." (OSTree guest-style).
+	 *
+	 * 2. l2s_host -> l2s_host: for symlinks whose target is the full
+	 *    host path (e.g. "/proot_rootfs/.l2s/..."), which proot's own
+	 *    link2symlink extension produces because move_and_symlink_path()
+	 *    operates on already-translated host paths. */
+	{
+		char l2s_host[PATH_MAX];
+		struct stat l2s_st;
+		int l2s_len = snprintf(l2s_host, sizeof(l2s_host),
+				       "%s/.l2s", old_root_host);
+		if (l2s_len > 0 && l2s_len < (int) sizeof(l2s_host)
+		    && stat(l2s_host, &l2s_st) == 0
+		    && S_ISDIR(l2s_st.st_mode)) {
+			(void) insort_binding3(tracee, tracee->fs, l2s_host, "/.l2s");
+			(void) insort_binding3(tracee, tracee->fs, l2s_host, l2s_host);
+		}
+	}
+
 	talloc_free(snapshot);
+	return 0;
 }
 
 /**
@@ -357,43 +517,45 @@ static void emulate_pivot_root(Tracee *tracee, const char *new_root_user,
  * (recommended -R bindings, the rootfs itself) are NOT removed: we
  * only drop runtime bindings whose guest path exactly matches.
  */
-static void emulate_umount(Tracee *tracee, const char *target_user)
+static int emulate_umount(Tracee *tracee, const char *target_user)
 {
 	char guest_path[PATH_MAX];
 	Binding *binding;
 
-	if (guest_canonicalize(tracee, target_user, guest_path) < 0)
-		return;
+	int status = guest_canonicalize(tracee, target_user, guest_path);
+	if (status < 0)
+		return status;
 
 	/* Never drop the root binding.  */
 	if (strcmp(guest_path, "/") == 0)
-		return;
+		return -EINVAL;
 
 	binding = get_binding(tracee, GUEST, guest_path);
 	if (binding == NULL)
-		return;
+		return -EINVAL;
 
 	/* Only drop the binding if its guest path is exactly the
 	 * unmount target; otherwise we'd unbind something the tracee
 	 * didn't ask to unmount (e.g. its containing rootfs).  */
 	if (strcmp(binding->guest.path, guest_path) != 0)
-		return;
+		return -EINVAL;
 
 	remove_binding_from_all_lists(tracee, binding);
+	return 0;
 }
 
 /**
  * Read umount(2)/umount2(2) arguments from the @tracee's registers
  * and apply emulate_umount().
  */
-void apply_emulated_umount(Tracee *tracee)
+int apply_emulated_umount(Tracee *tracee)
 {
 	char target_user[PATH_MAX];
 
 	if (get_sysarg_path(tracee, target_user, SYSARG_1) < 0)
-		return;
+		return -EFAULT;
 
-	emulate_umount(tracee, target_user);
+	return emulate_umount(tracee, target_user);
 }
 
 /**
@@ -402,7 +564,7 @@ void apply_emulated_umount(Tracee *tracee)
  * and the SIGSYS handler (Android's parent seccomp filter traps
  * mount, so the syscall never reaches our regular case).
  */
-void apply_emulated_mount(Tracee *tracee)
+int apply_emulated_mount(Tracee *tracee)
 {
 	char src_user[PATH_MAX];
 	char target_user[PATH_MAX];
@@ -417,33 +579,33 @@ void apply_emulated_mount(Tracee *tracee)
 	fstype[sizeof(fstype) - 1] = '\0';
 
 	if (get_sysarg_path(tracee, src_user, SYSARG_1) < 0)
-		return;
+		return -EFAULT;
 	if (get_sysarg_path(tracee, target_user, SYSARG_2) < 0)
-		return;
+		return -EFAULT;
 
 	fstype_addr = peek_reg(tracee, CURRENT, SYSARG_3);
 	if (fstype_addr != 0)
 		(void) read_string(tracee, fstype, fstype_addr, sizeof(fstype) - 1);
 	flags = peek_reg(tracee, CURRENT, SYSARG_4);
 
-	emulate_mount(tracee, src_user, target_user, fstype, flags);
+	return emulate_mount(tracee, src_user, target_user, fstype, flags);
 }
 
 /**
  * Read pivot_root(2) arguments from the @tracee's registers and apply
  * emulate_pivot_root().  See apply_emulated_mount() for context.
  */
-void apply_emulated_pivot_root(Tracee *tracee)
+int apply_emulated_pivot_root(Tracee *tracee)
 {
 	char new_root_user[PATH_MAX];
 	char put_old_user[PATH_MAX];
 
 	if (get_sysarg_path(tracee, new_root_user, SYSARG_1) < 0)
-		return;
+		return -EFAULT;
 	if (get_sysarg_path(tracee, put_old_user, SYSARG_2) < 0)
-		return;
+		return -EFAULT;
 
-	emulate_pivot_root(tracee, new_root_user, put_old_user);
+	return emulate_pivot_root(tracee, new_root_user, put_old_user);
 }
 
 /**
@@ -1950,10 +2112,9 @@ int translate_syscall_enter(Tracee *tracee)
 
 	case PR_umount:
 	case PR_umount2:
-		apply_emulated_umount(tracee);
-		poke_reg(tracee, SYSARG_RESULT, 0);
+		status = apply_emulated_umount(tracee);
+		poke_reg(tracee, SYSARG_RESULT, status);
 		set_sysnum(tracee, PR_void);
-		status = 0;
 		break;
 
 	/* Strip CLONE_NEW* flags from clone(2)/clone3(2) so the
@@ -1997,17 +2158,15 @@ int translate_syscall_enter(Tracee *tracee)
 	 * into PRoot bindings (see emulate_mount/emulate_pivot_root)
 	 * so the resulting paths actually become accessible.  */
 	case PR_mount:
-		apply_emulated_mount(tracee);
-		poke_reg(tracee, SYSARG_RESULT, 0);
+		status = apply_emulated_mount(tracee);
+		poke_reg(tracee, SYSARG_RESULT, status);
 		set_sysnum(tracee, PR_void);
-		status = 0;
 		break;
 
 	case PR_pivot_root:
-		apply_emulated_pivot_root(tracee);
-		poke_reg(tracee, SYSARG_RESULT, 0);
+		status = apply_emulated_pivot_root(tracee);
+		poke_reg(tracee, SYSARG_RESULT, status);
 		set_sysnum(tracee, PR_void);
-		status = 0;
 		break;
 
 	case PR_open:
@@ -2374,4 +2533,3 @@ end:
 
 	return status;
 }
-
