@@ -50,5 +50,5 @@ exec "$proot_bin" -S "$rootfs" \
   -l \
   -b "$sd"/fakeid.txt:/proc/sys/kernel/overflowuid \
   -b "$sd"/fakeid.txt:/proc/sys/kernel/overflowgid \
-  -b "$PREFIX"/tmp:/tmp \
+  -b "$rootfs"/tmp:/tmp \
   /bin/sh -l
