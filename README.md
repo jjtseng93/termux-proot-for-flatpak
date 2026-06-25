@@ -23,6 +23,8 @@ https://dl.flathub.org/repo/flathub.flatpakrepo
 ```
 
 - flatpak install <your_package>
+  * quick tip to overcome the flatpak search screen width too narrow doesn't show package name problem
+  * `flatpak search konsole | grep ''`
 - Exit proot-distro
 - Start termux-x11 as you will in termux desktop
 - termux-x11 :0 -listen tcp -ac &
