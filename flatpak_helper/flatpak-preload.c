@@ -38,6 +38,7 @@
 #include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <sys/syscall.h>
 
 #ifndef __O_TMPFILE
 #define __O_TMPFILE 020000000  /* 0x400000 — generic/aarch64 */
@@ -47,6 +48,54 @@ static int (*real_openat)  (int, const char *, int, ...);
 static int (*real_openat64)(int, const char *, int, ...);
 static int (*real_linkat)  (int, const char *, int, const char *, int);
 static int (*real_unshare) (int);
+
+/* ── Debug tracing (FPSHIM_DEBUG=1) ─────────────────────────────────────── */
+
+/* Check FPSHIM_DEBUG once and cache the result. */
+static int fpshim_debug_val = -1;
+
+static int
+fpshim_debug (void)
+{
+  if (fpshim_debug_val < 0)
+    fpshim_debug_val = getenv ("FPSHIM_DEBUG") ? 1 : 0;
+  return fpshim_debug_val;
+}
+
+/* fplog_fd is opened early (in the constructor) from the parent process so that
+ * clone()'d children inherit it even after they set up a private mount namespace
+ * with their own /tmp.  NOT O_CLOEXEC so children keep it across clone(). */
+static int fplog_fd = -1;
+
+static void __attribute__((constructor))
+fpshim_init (void)
+{
+  if (!fpshim_debug ())
+    return;
+  /* Open WITHOUT O_CLOEXEC so clone()'d children inherit this fd.
+   * Use O_APPEND so concurrent writes from parent/child don't interleave badly. */
+  fplog_fd = syscall (__NR_openat, AT_FDCWD, "/tmp/fpshim.log",
+                      O_WRONLY | O_CREAT | O_APPEND, 0644);
+}
+
+static void
+fplog_write (const char *buf, size_t n)
+{
+  /* Lazy fallback if constructor somehow didn't run. */
+  if (fplog_fd < 0)
+    fplog_fd = syscall (__NR_openat, AT_FDCWD, "/tmp/fpshim.log",
+                        O_WRONLY | O_CREAT | O_APPEND, 0644);
+  if (fplog_fd >= 0)
+    write (fplog_fd, buf, n);
+}
+
+#define FPLOG(fmt, ...) \
+  do { if (fpshim_debug()) { \
+    char _buf[512]; \
+    int _n = snprintf (_buf, sizeof (_buf), "[fpshim %d] " fmt "\n", getpid (), ##__VA_ARGS__); \
+    if (_n > 0) fplog_write (_buf, (size_t)(_n < (int)sizeof (_buf) ? _n : (int)sizeof(_buf)-1)); \
+  } } while (0)
+
 
 static void
 resolve_symbols (void)
@@ -364,6 +413,82 @@ unshare (int flags)
   return real_unshare (flags);
 }
 
+/* ── mount hook: fix /.flatpak-info bind mount ───────────────────────────
+ *
+ * bwrap creates /.flatpak-info via:
+ *   1. --file FD /.flatpak-info   → creates file in newroot tmpfs (OK)
+ *   2. --ro-bind-data FD /.flatpak-info → bind-mounts a PRIVATE tmpfs file
+ *      over it (source path like /bindfileXXX only exists in bwrap's own
+ *      private mount namespace).
+ *
+ * proot cannot translate this private-tmpfs source path, so it fakes the
+ * mount (returns 0) but never actually sets up the bind.  After pivot_root
+ * the file appears absent inside the sandbox.
+ *
+ * Fix: intercept the bind-mount call for /.flatpak-info and instead copy
+ * the content directly into the target file.  The target already exists as
+ * a regular file (from the --file step) so we just overwrite it.
+ */
+
+#include <sys/mount.h>
+
+int
+mount (const char *source, const char *target, const char *filesystemtype,
+       unsigned long mountflags, const void *data)
+{
+  static int (*real_mount)(const char *, const char *, const char *,
+                           unsigned long, const void *);
+  if (!real_mount) real_mount = dlsym (RTLD_NEXT, "mount");
+
+  /* bwrap's --ro-bind-data /.flatpak-info uses source "/bindfileXXX" which only
+   * exists in bwrap's private tmpfs.  proot cannot translate this path so the
+   * bind-mount is either faked or broken.  Fix: copy content directly into the
+   * target (created as a regular file by bwrap's --file step), then self-bind so
+   * bwrap's mountinfo check passes. */
+  if (target && strstr (target, "flatpak-info")
+      && (mountflags & MS_BIND)
+      && !(mountflags & MS_REMOUNT)
+      && source && source[0] == '/' && strncmp (source, "/bindfile", 9) == 0)
+    {
+      int sfd = syscall (__NR_openat, AT_FDCWD, source, O_RDONLY | O_CLOEXEC, 0);
+      int ok = 0;
+      if (sfd >= 0)
+        {
+          int wfd = syscall (__NR_openat, AT_FDCWD, target,
+                             O_WRONLY | O_TRUNC | O_CLOEXEC, 0);
+          if (wfd >= 0)
+            {
+              char buf[4096];
+              ssize_t n;
+              while ((n = read (sfd, buf, sizeof (buf))) > 0)
+                write (wfd, buf, (size_t) n);
+              syscall (__NR_close, wfd);
+              ok = 1;
+            }
+          else
+            FPLOG ("flatpak-info write FAIL tgt=%s errno=%d (%s)",
+                   target, errno, strerror (errno));
+          syscall (__NR_close, sfd);
+        }
+      else
+        FPLOG ("flatpak-info open FAIL src=%s errno=%d (%s)", source, errno, strerror (errno));
+
+      if (ok)
+        {
+          int r = real_mount (target, target, filesystemtype, mountflags, data);
+          if (r < 0)
+            FPLOG ("flatpak-info self-bind FAIL tgt=%s errno=%d (%s)",
+                   target, errno, strerror (errno));
+          return r;
+        }
+
+      FPLOG ("flatpak-info FAILED src=%s tgt=%s", source, target);
+      /* Fall through so bwrap reports its own error. */
+    }
+
+  return real_mount (source, target, filesystemtype, mountflags, data);
+}
+
 /* ── Public hooks ───────────────────────────────────────────────────────── */
 
 int
@@ -387,3 +512,4 @@ openat64 (int dirfd, const char *path, int flags, ...)
     { va_start (ap, flags); mode = (mode_t) va_arg (ap, int); va_end (ap); }
   return handle_openat (dirfd, path, flags, mode, real_openat64);
 }
+
