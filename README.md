@@ -15,6 +15,8 @@ which is a copy of [the PRoot project](https://github.com/proot-me/PRoot/) with 
 - org.gnome.TextEditor
 - org.kde.konsole
 - org.kde.kolourpaint
+- org.kde.falkon
+- (Web Browser based on QtWebEngine, a Chromium-based rendering engine)
 
 ## Usage
 ### 1. At the proot-distro side
