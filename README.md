@@ -48,6 +48,7 @@ https://dl.flathub.org/repo/flathub.flatpakrepo
 - export DISPLAY=:0 
 - (or your termux-x11 startup number)
 - (Connects over tcp)
+- dbus-launch sh
 - sh run.sh <your_package>
 - .
 - You can install org.gnome.Calculator for testing

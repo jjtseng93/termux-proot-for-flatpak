@@ -48,6 +48,7 @@ echo '===='
 
 exec "$proot_bin" -S "$rootfs" \
   -l \
+  -b "$PREFIX"/tmp \
   -b "$sd"/fakeid.txt:/proc/sys/kernel/overflowuid \
   -b "$sd"/fakeid.txt:/proc/sys/kernel/overflowgid \
   -b "$rootfs"/tmp:/tmp \
