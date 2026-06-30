@@ -61,4 +61,4 @@ if [ -f "$_proxy_marker" ]; then
   done
 fi
 
-exec bwrap-real --bind /dev/ptmx /dev/pts/ptmx --bind /data /data "$@"
+exec bwrap-real --bind "$PREFIX"/tmp "$PREFIX"/tmp --bind /dev/ptmx /dev/pts/ptmx --bind /data /data "$@"

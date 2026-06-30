@@ -57,5 +57,19 @@ if [ -z "$1" ] ; then
   exec flatpak run --env=LD_LIBRARY_PATH=/app/lib:/app/lib/aarch64-linux-gnu --command=/bin/sh org.gnome.Platform
 else
   export LD_PRELOAD="$SHIM"
+  _is_falkon=0
+  for _arg in "$@"; do
+    [ "$_arg" = "org.kde.falkon" ] && _is_falkon=1
+  done
+  if [ "$_is_falkon" = "1" ]; then
+    exec flatpak run \
+      --env=LD_LIBRARY_PATH=/app/lib:/app/lib/aarch64-linux-gnu \
+      --env=QTWEBENGINEPROCESS_PATH=/app/bin/QtWebEngineProcess \
+      --env=QTWEBENGINE_DISABLE_SANDBOX=1 \
+      --env=QTWEBENGINE_CHROMIUM_FLAGS=--disable-gpu \
+      --env=QT_XCB_GL_INTEGRATION=none \
+      --env=QT_QUICK_BACKEND=software \
+      "$@"
+  fi
   exec flatpak run --env=LD_LIBRARY_PATH=/app/lib:/app/lib/aarch64-linux-gnu "$@"
 fi
